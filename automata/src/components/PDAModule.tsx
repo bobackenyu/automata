@@ -23,7 +23,8 @@ interface SimResult {
 }
 
 function getConfig(regex: RegexChoice) {
-  if (regex === "regex1") {
+  // Fix: regex2 is the binary pattern according to AutomataSimulator
+  if (regex === "regex2") { 
     return {
       sigma: "{ 0, 1 }",
       gamma: "{ $, 0, 1 }",
@@ -34,6 +35,8 @@ function getConfig(regex: RegexChoice) {
       symToStack: (c: string) => c,
     };
   }
+  
+  // regex1 is the alphabet pattern
   return {
     sigma: "{ a, b }",
     gamma: "{ $, A, B }",
