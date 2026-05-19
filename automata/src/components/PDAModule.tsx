@@ -345,7 +345,7 @@ const PDAModule: React.FC<PDAModuleProps> = ({
 
       {/* ── Simulation output ── */}
       {result ? (
-        <div className="flex gap-3 flex-1 min-h-0">
+        <div className="flex gap-3 shrink-0 pb-6"> 
 
           {/* Live Stack */}
           <div className="bg-white rounded-lg border border-gray-300 p-3 flex flex-col items-center gap-1 min-w-[68px]">
@@ -414,7 +414,7 @@ const PDAModule: React.FC<PDAModuleProps> = ({
 
             {/* Trace table */}
             {showTrace && (
-              <div className="overflow-auto rounded-lg border border-gray-300 bg-white flex-1">
+              <div className="overflow-x-auto rounded-lg border border-gray-300 bg-white mt-1">
                 <table className="w-full text-[10px] text-left">
                   <thead className="bg-gray-100 text-gray-500 uppercase tracking-wider sticky top-0">
                     <tr>
