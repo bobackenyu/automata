@@ -18,6 +18,9 @@ import { cfgEngine01, cfgEngineAB, type TraceStep } from "../lib/CfgEngine";
 import { CfgVisualizer } from "./CfgVisualizer";
 import { Cfg01Grammar, CfgABGrammar } from "../constants/CfgGrammars";
 
+// PDA Imports
+import PDAModule from "./PDAModule";
+
 type ModelType = "dfa" | "cfg" | "pda";
 type RegexChoice = "regex1" | "regex2";
 
@@ -97,6 +100,9 @@ export function AutomataSimulator({ selectedRegex, selectedModel, handleNavigate
   const [currentStep, setCurrentStep] = useState(-1);
   const [cfgError, setCfgError] = useState<string | null>(null);
 
+  // PDA States
+  const [lastSimulatedPda, setLastSimulatedPda] = useState<{ input: string; rowId: number } | null>(null);
+
   // Cancel State
   const simulationRef = useRef<number>(0)
 
@@ -159,6 +165,15 @@ export function AutomataSimulator({ selectedRegex, selectedModel, handleNavigate
     );
   }; 
 
+  // Handler for PDA callback to update row UI
+  const handlePdaResult = (rowId: number, isValid: boolean) => {
+    setRows((prev) =>
+      prev.map((r) =>
+        r.id === rowId ? { ...r, status: isValid ? "VALID" : "INVALID" } : r
+      )
+    );
+  };
+
   // Animation Delay
   const sleep = (ms: number) => new Promise((resolve) => setTimeout(resolve, ms));
 
@@ -180,7 +195,6 @@ export function AutomataSimulator({ selectedRegex, selectedModel, handleNavigate
         }
         )
       );
-
 
       if (selectedModel == 'dfa') {
         let {isValid, path} = validateDfa({...dfaValues, word: input} )
@@ -299,11 +313,16 @@ export function AutomataSimulator({ selectedRegex, selectedModel, handleNavigate
           setCfgError(result.error || "String rejected by grammar.");
           status = "INVALID";
         }
+      } else if (selectedModel === 'pda') {
+        // Pass the row data down to PDAModule, let it update its internal state
+        setLastSimulatedPda({ input, rowId });
+        status = "PROCESSING"; // Stays PROCESSING until the callback updates it
       }
     } 
 
-    // Update the status (only if it wasn't interrupted)
-    if (currentSimId === simulationRef.current) {
+    // Update the status (only if it wasn't interrupted). 
+    // We omit PDA because its status is handled asynchronously via callback.
+    if (currentSimId === simulationRef.current && selectedModel !== 'pda') {
       setRows((prev) =>
         prev.map((r) => (r.id === rowId ? { ...r, status } : r))
       );
@@ -336,6 +355,9 @@ export function AutomataSimulator({ selectedRegex, selectedModel, handleNavigate
       setCfgSteps([]);
       setCurrentStep(-1);
       setCfgError(null);
+
+      // Reset PDA States
+      setLastSimulatedPda(null);
 
   }, [selectedRegex, selectedModel])
 
@@ -457,7 +479,7 @@ export function AutomataSimulator({ selectedRegex, selectedModel, handleNavigate
                 />
                 <Controls />
               </ReactFlow>
-            ) : (selectedModel === "cfg") ? (
+            ) : selectedModel === "cfg" ? (
               <CfgVisualizer
                 steps={cfgSteps}
                 grammarFormal={selectedRegex === "regex2" ? Cfg01Grammar.formal : CfgABGrammar.formal}
@@ -466,11 +488,11 @@ export function AutomataSimulator({ selectedRegex, selectedModel, handleNavigate
                 isSimulationComplete={status === "VALID" || (currentStep === cfgSteps.length - 1 && !cfgError)}
               />
             ) : (
-                <div className="w-full h-full flex items-center justify-center">
-                <p className="text-lg text-black font-normal tracking-tight text-center px-4">
-                  Graph rendering for {selectedModel.toUpperCase()} will be implemented soon...
-                </p>
-              </div>
+              <PDAModule 
+                lastSimulated={lastSimulatedPda}
+                selectedRegex={selectedRegex}
+                onSimulationComplete={handlePdaResult}
+              />
             )}
           </div>
         </div>
