@@ -1,628 +1,484 @@
-import React from "react";
+import React, { useRef, useState, useCallback } from "react";
 
-// ─────────────────────────────────────────────────────────────
-//  PDABinaryFlowchart.tsx
-//  Regex: (11+00)(1+0)*(101+111+01)(00*+11*)(1+0+11)
-//
-//  Fully hardcoded SVG — no external assets, no tracing.
-//  Five-stage PDA pipeline, left-to-right:
-//    S1: (11+00)          — two-char prefix gate
-//    S2: (1+0)*           — self-loop (any length middle run)
-//    S3: (101+111+01)     — three-branch pattern block
-//    S4: (00*+11*)        — typed repeat loop
-//    S5: (1+0+11)         — final token gate → ACCEPT
-// ─────────────────────────────────────────────────────────────
+// ─── Types ───────────────────────────────────────────────────────────────────
+interface Node {
+  id: string;
+  x: number;
+  y: number;
+  type: "start" | "read" | "accept" | "reject" | "racc";
+  label: string;
+  sub?: string;
+}
 
-// ── Design tokens ─────────────────────────────────────────────
-const T = {
-  bg:            "#0d0d0d",
-  diamondFill:   "#0f1f3d",
-  diamondStroke: "#74DCFF",
-  loopFill:      "#0d2b1f",
-  loopStroke:    "#34d399",   // green-tinted for the loop node
-  startFill:     "#3b1f6e",
-  startStroke:   "#a855f7",
-  acceptFill:    "#14532d",
-  acceptStroke:  "#22c55e",
-  rejectFill:    "#450a0a",
-  rejectStroke:  "#ef4444",
-  arrowGrey:     "#6b7280",
-  arrowRed:      "#ef4444",
-  arrowGreen:    "#22c55e",
-  arrowCyan:     "#74DCFF",
-  nodeText:      "#74DCFF",
-  loopText:      "#34d399",
-  edgeLabel:     "#e5e7eb",
-  dimLabel:      "#6b7280",
-};
+interface Edge {
+  from: string;
+  to: string;
+  label: string;
+  /** Optional explicit control-point offsets [cx1,cy1,cx2,cy2] for cubic bezier */
+  cp?: [number, number, number, number];
+  /** For self-loops provide a loop direction hint */
+  loop?: "top" | "bottom" | "left" | "right";
+  /** label offset from midpoint */
+  lx?: number;
+  ly?: number;
+}
 
-// ── SVG viewport ──────────────────────────────────────────────
-const VW = 1660;
-const VH = 760;
+// ─── Layout constants ────────────────────────────────────────────────────────
+const DW = 54;   // diamond half-width
+const DH = 30;   // diamond half-height
+const RX = 28;   // read-node rx ellipse
+const RY = 16;   // read-node ry ellipse (but diamond is used)
+const CYN = "#74DCFF";
+const RED = "#FF4444";
+const GRN = "#00FF99";
+const PUR = "#9B59B6";
+const DARK = "#0d0d0d";
+const GRID_W = 2000;
+const GRID_H = 820;
 
-// ── Node geometry ─────────────────────────────────────────────
-const DW = 42;   // diamond half-width
-const DH = 27;   // diamond half-height
-const OR = { rx: 36, ry: 17 };   // standard oval
-const SR = { rx: 32, ry: 15 };   // small reject oval
+// ─── Node definitions (x,y = center) ────────────────────────────────────────
+const NODES: Node[] = [
+  // Spine
+  { id: "START",  x: 60,   y: 410, type: "start",  label: "START" },
+  { id: "R1",     x: 180,  y: 410, type: "read",   label: "READ", sub: "1" },
 
-// ── Node centre coordinates [x, y] ───────────────────────────
-//  Main spine:  y = 370
-//  Upper track: y = 195
-//  Lower track: y = 545
-//  Top rejects: y = 100
-//  Bot rejects: y = 640
-const N = {
-  // ── Terminals ──
-  start:       [60,  370] as [number, number],
-  accept:      [1580, 370] as [number, number],
+  // Upper path (11)
+  { id: "R2a",    x: 320,  y: 270, type: "read",   label: "READ", sub: "2a" },
+  { id: "R3a",    x: 460,  y: 270, type: "read",   label: "READ", sub: "3a" },
 
-  // ── Stage 1: (11+00) ──
-  s1:          [170, 370] as [number, number],   // READ first char
-  s1b1:        [295, 195] as [number, number],   // READ second char (after '1')
-  s1b0:        [295, 545] as [number, number],   // READ second char (after '0')
-  rej_s1_d:    [170, 500] as [number, number],   // Δ too early at S1
-  rej_s1b1_0:  [215, 100] as [number, number],   // '0' after first '1' (got "10") — REJECT
-  rej_s1b1_d:  [340, 100] as [number, number],   // Δ at S1b1 — REJECT
-  rej_s1b0_1:  [215, 640] as [number, number],   // '1' after first '0' (got "01") — REJECT
-  rej_s1b0_d:  [340, 640] as [number, number],   // Δ at S1b0 — REJECT
+  // Lower path (00)
+  { id: "R2b",    x: 320,  y: 550, type: "read",   label: "READ", sub: "2b" },
+  { id: "R3b",    x: 460,  y: 550, type: "read",   label: "READ", sub: "3b" },
 
-  // ── Stage 2: (1+0)* loop ──
-  loop:        [435, 370] as [number, number],   // self-loop node (green variant)
+  // (1+0)* convergence / middle hub
+  { id: "R4",     x: 620,  y: 410, type: "read",   label: "READ", sub: "4" },
 
-  // ── Stage 3: (101+111+01) ──
-  s3br:        [560, 370] as [number, number],   // S3 branch gate
-  rej_s3_d:    [560, 500] as [number, number],   // Δ at S3 gate — REJECT
+  // (101+111+01) upper sub-path
+  { id: "R5a",    x: 760,  y: 270, type: "read",   label: "READ", sub: "5a" },
+  { id: "R6a",    x: 900,  y: 270, type: "read",   label: "READ", sub: "6a" },
 
-  s3_1:        [670, 195] as [number, number],   // after reading '1' (101 or 111 path)
-  s3_0:        [670, 545] as [number, number],   // after reading '0' (01 path)
-  rej_s3_1_d:  [670, 100] as [number, number],   // Δ at S3_1 — REJECT
-  rej_s3_0_x:  [745, 640] as [number, number],   // non-'1' at S3_0 — REJECT
+  // (101+111+01) lower sub-path
+  { id: "R5b",    x: 760,  y: 550, type: "read",   label: "READ", sub: "5b" },
+  { id: "R6b",    x: 900,  y: 550, type: "read",   label: "READ", sub: "6b" },
 
-  s3_10:       [785, 220] as [number, number],   // after reading '10' (→ need '1')
-  s3_11:       [785, 140] as [number, number],   // after reading '11' (→ need '1')
-  rej_s3_10_x: [870, 220] as [number, number],   // bad char at S3_10 — REJECT
-  rej_s3_11_x: [870, 140] as [number, number],   // bad char at S3_11 — REJECT
+  // (00*+11*) section
+  { id: "R7",     x: 1060, y: 410, type: "read",   label: "READ", sub: "7" },
+  { id: "R8a",    x: 1200, y: 270, type: "read",   label: "READ", sub: "8a" },
+  { id: "R8b",    x: 1200, y: 410, type: "read",   label: "READ", sub: "8b" },
+  { id: "R8c",    x: 1200, y: 550, type: "read",   label: "READ", sub: "8c" },
 
-  // ── Stage 4: (00*+11*) ──
-  s4br:        [920, 370] as [number, number],   // S4 branch gate
-  rej_s4_d:    [920, 500] as [number, number],   // Δ at S4 gate — REJECT
+  // (1+0+11) terminals → ACCEPT
+  { id: "R9a",    x: 1380, y: 270, type: "read",   label: "READ", sub: "9a" },
+  { id: "R9b",    x: 1380, y: 410, type: "read",   label: "READ", sub: "9b" },
+  { id: "R9c",    x: 1380, y: 550, type: "read",   label: "READ", sub: "9c" },
 
-  s4_1loop:    [1035, 195] as [number, number],  // 1-run loop (after first '1')
-  s4_0loop:    [1035, 545] as [number, number],  // 0-run loop (after first '0')
+  // ACCEPT nodes
+  { id: "ACC_a",  x: 1560, y: 270, type: "accept", label: "ACCEPT" },
+  { id: "ACC_b",  x: 1560, y: 410, type: "accept", label: "ACCEPT" },
+  { id: "ACC_c",  x: 1560, y: 550, type: "accept", label: "ACCEPT" },
 
-  // ── Stage 5: (1+0+11) ──
-  s5br:        [1160, 370] as [number, number],  // S5 branch gate
-  rej_s5_d:    [1160, 500] as [number, number],  // Δ at S5 gate — REJECT
+  // REJECT nodes — one per failed branch
+  { id: "REJ_R1_d",  x: 180,  y: 530, type: "reject", label: "REJECT" },  // Δ from R1
+  { id: "REJ_R2a",   x: 320,  y: 150, type: "reject", label: "REJECT" },  // bad bit after 1
+  { id: "REJ_R2b",   x: 320,  y: 670, type: "reject", label: "REJECT" },  // bad bit after 0
+  { id: "REJ_R3a",   x: 460,  y: 150, type: "reject", label: "REJECT" },
+  { id: "REJ_R3b",   x: 460,  y: 670, type: "reject", label: "REJECT" },
+  { id: "REJ_R4",    x: 620,  y: 530, type: "reject", label: "REJECT" },  // Δ
+  { id: "REJ_R5a",   x: 760,  y: 150, type: "reject", label: "REJECT" },
+  { id: "REJ_R5b",   x: 760,  y: 670, type: "reject", label: "REJECT" },
+  { id: "REJ_R6a",   x: 900,  y: 150, type: "reject", label: "REJECT" },
+  { id: "REJ_R6b",   x: 900,  y: 670, type: "reject", label: "REJECT" },
+  { id: "REJ_R7",    x: 1060, y: 270, type: "reject", label: "REJECT" },
+  { id: "REJ_R8a",   x: 1200, y: 150, type: "reject", label: "REJECT" },
+  { id: "REJ_R8b_t", x: 1200, y: 290, type: "reject", label: "REJECT" },
+  { id: "REJ_R8c",   x: 1200, y: 670, type: "reject", label: "REJECT" },
+  { id: "REJ_R9a",   x: 1380, y: 150, type: "reject", label: "REJECT" },
+  { id: "REJ_R9b",   x: 1380, y: 290, type: "reject", label: "REJECT" },
+  { id: "REJ_R9c",   x: 1380, y: 670, type: "reject", label: "REJECT" },
+];
 
-  s5_1:        [1270, 195] as [number, number],  // after first '1' (could be "1" or "11")
-  s5_0:        [1270, 545] as [number, number],  // after '0' (just "0")
-  rej_s5_1_x:  [1270, 100] as [number, number],  // non-Δ,non-'1' after S5_1 — REJECT
-  rej_s5_0_x:  [1270, 640] as [number, number],  // non-Δ after S5_0 — REJECT
+// ─── Edge definitions ────────────────────────────────────────────────────────
+const EDGES: Edge[] = [
+  // START → R1
+  { from: "START", to: "R1",   label: "" },
 
-  s5_11:       [1390, 195] as [number, number],  // after reading "11"
-  rej_s5_11_x: [1390, 100] as [number, number],  // non-Δ after S5_11 — REJECT
+  // R1 branches
+  { from: "R1", to: "R2a",         label: "1" },
+  { from: "R1", to: "R2b",         label: "0" },
+  { from: "R1", to: "REJ_R1_d",    label: "Δ" },
 
-  // ── Pre-accept ──
-  racc:        [1465, 370] as [number, number],  // R.ACC
-};
+  // Upper (11) path
+  { from: "R2a", to: "R3a",        label: "1" },
+  { from: "R2a", to: "REJ_R2a",    label: "0,Δ" },
+  { from: "R3a", to: "R4",         label: "" ,  lx: 0, ly: -12 },
+  { from: "R3a", to: "REJ_R3a",    label: "Δ" },
 
-// ── Helpers ───────────────────────────────────────────────────
+  // Lower (00) path
+  { from: "R2b", to: "R3b",        label: "0" },
+  { from: "R2b", to: "REJ_R2b",    label: "1,Δ" },
+  { from: "R3b", to: "R4",         label: "" },
+  { from: "R3b", to: "REJ_R3b",    label: "Δ" },
 
-/** Arrowhead marker definition */
-const Marker: React.FC<{ id: string; color: string }> = ({ id, color }) => (
-  <marker id={id} markerWidth={8} markerHeight={8} refX={6} refY={3} orient="auto">
-    <path d="M0,0 L0,6 L8,3 z" fill={color} />
-  </marker>
-);
+  // R4 self-loop (1+0)*
+  { from: "R4",  to: "R4",         label: "0,1", loop: "top" },
 
-/** Multi-waypoint arrow */
-const Arrow: React.FC<{
-  pts: [number, number][];
-  marker: string;
-  color: string;
-  dashed?: boolean;
-}> = ({ pts, marker, color, dashed }) => {
-  const d = pts.map(([x, y], i) => `${i === 0 ? "M" : "L"}${x},${y}`).join(" ");
-  return (
-    <path d={d} fill="none" stroke={color} strokeWidth={1.5}
-      strokeDasharray={dashed ? "5,3" : undefined}
-      markerEnd={`url(#${marker})`} />
-  );
-};
+  // R4 → branching to (101+111+01)
+  { from: "R4",  to: "R5a",        label: "1" },
+  { from: "R4",  to: "R5b",        label: "0" },
+  { from: "R4",  to: "REJ_R4",     label: "Δ" },
 
-/** Edge label */
-const EL: React.FC<{
-  x: number; y: number; text: string;
-  red?: boolean; cyan?: boolean; green?: boolean;
-}> = ({ x, y, text, red, cyan, green }) => {
-  const fill = red ? "#f87171" : cyan ? "#74DCFF" : green ? "#4ade80" : T.edgeLabel;
-  return (
-    <text x={x} y={y} textAnchor="middle" dominantBaseline="central"
-      fontSize={11} fontWeight={700} fill={fill}>
-      {text}
-    </text>
-  );
-};
+  // Upper (101 / 111) sub-path
+  { from: "R5a", to: "R6a",        label: "0,1" },
+  { from: "R5a", to: "REJ_R5a",    label: "Δ" },
+  { from: "R6a", to: "R7",         label: "1" },
+  { from: "R6a", to: "REJ_R6a",    label: "0,Δ" },
 
-/** Self-loop arc above a diamond node */
-const SelfLoop: React.FC<{ cx: number; cy: number; color: string; markerId: string }> = ({
-  cx, cy, color, markerId,
-}) => {
-  const r = 18;
-  // Arc that starts from top-left of diamond, loops above, ends at top-right
-  const x1 = cx - DW * 0.6;
-  const y1 = cy - DH * 0.5;
-  const x2 = cx + DW * 0.6;
-  const y2 = y1;
-  return (
-    <path
-      d={`M${x1},${y1} C${x1},${y1 - r * 2} ${x2},${y2 - r * 2} ${x2},${y2}`}
-      fill="none" stroke={color} strokeWidth={1.5}
-      markerEnd={`url(#${markerId})`}
-    />
-  );
-};
+  // Lower (01) sub-path
+  { from: "R5b", to: "R6b",        label: "1" },
+  { from: "R5b", to: "REJ_R5b",    label: "0,Δ" },
+  { from: "R6b", to: "R7",         label: "1" },
+  { from: "R6b", to: "REJ_R6b",    label: "0,Δ" },
 
-/** Diamond node (READ / branch gates / R.ACC) */
-const Dmd: React.FC<{
-  cx: number; cy: number;
-  line1: string; line2?: string;
-  loop?: boolean;   // use green loop variant
-}> = ({ cx, cy, line1, line2, loop }) => {
-  const pts = `${cx},${cy - DH} ${cx + DW},${cy} ${cx},${cy + DH} ${cx - DW},${cy}`;
-  const fill   = loop ? T.loopFill   : T.diamondFill;
-  const stroke = loop ? T.loopStroke : T.diamondStroke;
-  const tFill  = loop ? T.loopText   : T.nodeText;
+  // R7 → (00*+11*) section
+  { from: "R7",  to: "R8a",        label: "1" },
+  { from: "R7",  to: "R8c",        label: "0" },
+  { from: "R7",  to: "REJ_R7",     label: "Δ" },
+
+  // R8a (11* path)
+  { from: "R8a", to: "R8a",        label: "1", loop: "top" },
+  { from: "R8a", to: "R9a",        label: "1", lx: 0, ly: -12 },
+  { from: "R8a", to: "REJ_R8a",    label: "0,Δ" },
+
+  // R8b middle neutral
+  { from: "R8b", to: "R9b",        label: "0,1" },
+  { from: "R8b", to: "REJ_R8b_t",  label: "Δ" },
+
+  // R8c (00* path)
+  { from: "R8c", to: "R8c",        label: "0", loop: "bottom" },
+  { from: "R8c", to: "R9c",        label: "0" },
+  { from: "R8c", to: "REJ_R8c",    label: "1,Δ" },
+
+  // R7 → R8b (neutral middle, epsilon / short path)
+  { from: "R7",  to: "R8b",        label: "ε" },
+
+  // Final (1+0+11) terminals
+  { from: "R9a", to: "ACC_a",      label: "1" },
+  { from: "R9a", to: "REJ_R9a",    label: "0,Δ" },
+
+  { from: "R9b", to: "ACC_b",      label: "0,1" },
+  { from: "R9b", to: "REJ_R9b",    label: "Δ" },
+
+  { from: "R9c", to: "ACC_c",      label: "1" },
+  { from: "R9c", to: "REJ_R9c",    label: "0,Δ" },
+];
+
+// ─── Helpers ─────────────────────────────────────────────────────────────────
+function nodeById(id: string): Node {
+  const n = NODES.find((n) => n.id === id);
+  if (!n) throw new Error(`Node not found: ${id}`);
+  return n;
+}
+
+/** Get border point of a node in direction of angle θ (radians) */
+function borderPoint(n: Node, θ: number): [number, number] {
+  if (n.type === "start" || n.type === "accept" || n.type === "racc") {
+    // ellipse
+    const rx = n.type === "start" ? 36 : 44;
+    const ry = 18;
+    return [n.x + rx * Math.cos(θ), n.y + ry * Math.sin(θ)];
+  }
+  if (n.type === "reject") {
+    // small ellipse
+    return [n.x + 34 * Math.cos(θ), n.y + 16 * Math.sin(θ)];
+  }
+  // diamond — find intersection of ray from center with diamond edges
+  const dx = Math.cos(θ);
+  const dy = Math.sin(θ);
+  // Diamond vertices: top, right, bottom, left
+  const hw = DW, hh = DH;
+  // Parametric: P = center + t*(dx,dy)
+  // Edges: top-right, right-bottom, bottom-left, left-top
+  const edges: [[number,number],[number,number]][] = [
+    [[0, -hh], [hw, 0]],
+    [[hw, 0],  [0,  hh]],
+    [[0,  hh], [-hw, 0]],
+    [[-hw, 0], [0, -hh]],
+  ];
+  let best: [number,number] = [n.x + dx * hw, n.y + dy * hh];
+  let tMin = Infinity;
+  for (const [[ax, ay], [bx, by]] of edges) {
+    // Ray: P = t*(dx,dy),  Line: Q = (ax,ay) + s*((bx-ax),(by-ay))
+    const ex = bx - ax, ey = by - ay;
+    const denom = dx * ey - dy * ex;
+    if (Math.abs(denom) < 1e-8) continue;
+    const t = (ax * ey - ay * ex) / denom;
+    const s = (ax * dy - ay * dx) / denom;
+    if (t > 1e-6 && s >= 0 && s <= 1 && t < tMin) {
+      tMin = t;
+      best = [n.x + t * dx, n.y + t * dy];
+    }
+  }
+  return best;
+}
+
+function angle(x1: number, y1: number, x2: number, y2: number): number {
+  return Math.atan2(y2 - y1, x2 - x1);
+}
+
+// ─── SVG sub-components ──────────────────────────────────────────────────────
+function Diamond({ n }: { n: Node }) {
+  const pts = `${n.x},${n.y - DH} ${n.x + DW},${n.y} ${n.x},${n.y + DH} ${n.x - DW},${n.y}`;
   return (
     <g>
-      <polygon points={pts} fill={fill} stroke={stroke} strokeWidth={1.8} />
-      <text x={cx} y={line2 ? cy - 5 : cy}
-        textAnchor="middle" dominantBaseline="central"
-        fontSize={9} fontWeight={700} fill={tFill}>
-        {line1}
+      <polygon points={pts} fill="#0a1a2a" stroke={CYN} strokeWidth={1.5} />
+      <text x={n.x} y={n.y - 6} textAnchor="middle" fill={CYN} fontSize={9} fontFamily="monospace" fontWeight="bold">
+        {n.label}
       </text>
-      {line2 && (
-        <text x={cx} y={cy + 7}
-          textAnchor="middle" dominantBaseline="central"
-          fontSize={8} fill={tFill}>
-          {line2}
-        </text>
+      <text x={n.x} y={n.y + 8} textAnchor="middle" fill={CYN} fontSize={8} fontFamily="monospace">
+        {n.sub}
+      </text>
+    </g>
+  );
+}
+
+function StartNode({ n }: { n: Node }) {
+  return (
+    <g>
+      <ellipse cx={n.x} cy={n.y} rx={36} ry={18} fill="#2a0a4a" stroke={PUR} strokeWidth={1.5} />
+      <text x={n.x} y={n.y + 4} textAnchor="middle" fill={PUR} fontSize={9} fontFamily="monospace" fontWeight="bold">
+        {n.label}
+      </text>
+    </g>
+  );
+}
+
+function AcceptNode({ n }: { n: Node }) {
+  return (
+    <g>
+      <ellipse cx={n.x} cy={n.y} rx={44} ry={18} fill="#003322" stroke={GRN} strokeWidth={2} />
+      <ellipse cx={n.x} cy={n.y} rx={40} ry={14} fill="none" stroke={GRN} strokeWidth={0.8} />
+      <text x={n.x} y={n.y + 4} textAnchor="middle" fill={GRN} fontSize={9} fontFamily="monospace" fontWeight="bold">
+        {n.label}
+      </text>
+    </g>
+  );
+}
+
+function RejectNode({ n }: { n: Node }) {
+  return (
+    <g>
+      <ellipse cx={n.x} cy={n.y} rx={34} ry={16} fill="#2a0000" stroke={RED} strokeWidth={1.5} />
+      <text x={n.x} y={n.y + 4} textAnchor="middle" fill={RED} fontSize={9} fontFamily="monospace" fontWeight="bold">
+        {n.label}
+      </text>
+    </g>
+  );
+}
+
+function renderNode(n: Node) {
+  switch (n.type) {
+    case "start":  return <StartNode key={n.id} n={n} />;
+    case "accept":
+    case "racc":   return <AcceptNode key={n.id} n={n} />;
+    case "reject": return <RejectNode key={n.id} n={n} />;
+    default:       return <Diamond key={n.id} n={n} />;
+  }
+}
+
+// ─── Arrow marker ─────────────────────────────────────────────────────────────
+function Defs() {
+  return (
+    <defs>
+      <marker id="arr" markerWidth="8" markerHeight="8" refX="6" refY="3" orient="auto">
+        <path d="M0,0 L0,6 L8,3 z" fill={CYN} />
+      </marker>
+      <marker id="arr-red" markerWidth="8" markerHeight="8" refX="6" refY="3" orient="auto">
+        <path d="M0,0 L0,6 L8,3 z" fill={RED} />
+      </marker>
+      <filter id="glow">
+        <feGaussianBlur stdDeviation="2" result="blur" />
+        <feMerge><feMergeNode in="blur" /><feMergeNode in="SourceGraphic" /></feMerge>
+      </filter>
+    </defs>
+  );
+}
+
+// ─── Edge renderer ───────────────────────────────────────────────────────────
+function EdgeLine({ e }: { e: Edge }) {
+  const fromN = nodeById(e.from);
+  const toN   = nodeById(e.to);
+  const isRej = toN.type === "reject";
+  const color = isRej ? RED : CYN;
+  const marker = isRej ? "url(#arr-red)" : "url(#arr)";
+
+  // Self-loop
+  if (e.from === e.to) {
+    const lx = e.loop === "bottom" ? fromN.x : fromN.x;
+    const ly = e.loop === "bottom" ? fromN.y + DH : fromN.y - DH;
+    const r  = e.loop === "bottom" ? 28 : 28;
+    const sweep = e.loop === "bottom" ? 1 : 0;
+    // Arc from left border-top to right border-top via top
+    const x1 = fromN.x - 20, y1 = ly;
+    const x2 = fromN.x + 20, y2 = ly;
+    const path = `M${x1},${y1} A${r},${r} 0 1,${sweep} ${x2},${y2}`;
+    const mx = lx, my = e.loop === "bottom" ? ly + 38 : ly - 38;
+    return (
+      <g>
+        <path d={path} fill="none" stroke={color} strokeWidth={1.2} markerEnd={marker} />
+        <text x={mx + (e.lx ?? 0)} y={my + (e.ly ?? 0)} textAnchor="middle" fill={color} fontSize={9} fontFamily="monospace">{e.label}</text>
+      </g>
+    );
+  }
+
+  const θ = angle(fromN.x, fromN.y, toN.x, toN.y);
+  const θ_rev = θ + Math.PI;
+  let [x1, y1] = borderPoint(fromN, θ);
+  let [x2, y2] = borderPoint(toN, θ_rev);
+
+  let pathD: string;
+  let mx: number, my: number;
+
+  if (e.cp) {
+    const [cx1, cy1, cx2, cy2] = e.cp;
+    pathD = `M${x1},${y1} C${cx1},${cy1} ${cx2},${cy2} ${x2},${y2}`;
+    mx = (x1 + x2) / 2; my = (y1 + y2) / 2;
+  } else {
+    pathD = `M${x1},${y1} L${x2},${y2}`;
+    mx = (x1 + x2) / 2; my = (y1 + y2) / 2;
+  }
+
+  return (
+    <g>
+      <path d={pathD} fill="none" stroke={color} strokeWidth={1.2} markerEnd={marker} />
+      {e.label && (
+        <text x={mx + (e.lx ?? 0)} y={my + (e.ly ?? 0) - 5} textAnchor="middle" fill={color} fontSize={9} fontFamily="monospace">{e.label}</text>
       )}
     </g>
   );
+}
+
+// ─── Main component ──────────────────────────────────────────────────────────
+const PDABinaryFlowchart: React.FC = () => {
+  const containerRef = useRef<HTMLDivElement>(null);
+  const [isDragging, setIsDragging] = useState(false);
+  const [scroll, setScroll] = useState({ x: 0, y: 0 });
+  const dragStart = useRef<{ mx: number; my: number; sx: number; sy: number } | null>(null);
+
+  const onMouseDown = useCallback((e: React.MouseEvent) => {
+    if (!containerRef.current) return;
+    setIsDragging(true);
+    dragStart.current = {
+      mx: e.clientX,
+      my: e.clientY,
+      sx: containerRef.current.scrollLeft,
+      sy: containerRef.current.scrollTop,
+    };
+  }, []);
+
+  const onMouseMove = useCallback((e: React.MouseEvent) => {
+    if (!isDragging || !dragStart.current || !containerRef.current) return;
+    const dx = e.clientX - dragStart.current.mx;
+    const dy = e.clientY - dragStart.current.my;
+    containerRef.current.scrollLeft = dragStart.current.sx - dx;
+    containerRef.current.scrollTop  = dragStart.current.sy - dy;
+  }, [isDragging]);
+
+  const onMouseUp = useCallback(() => {
+    setIsDragging(false);
+    dragStart.current = null;
+  }, []);
+
+  return (
+    <div style={{ background: DARK, width: "100%", height: "100vh", display: "flex", flexDirection: "column" }}>
+      {/* Header */}
+      <div style={{
+        padding: "10px 20px",
+        borderBottom: `1px solid ${CYN}22`,
+        display: "flex",
+        alignItems: "center",
+        gap: 16,
+        flexShrink: 0,
+      }}>
+        <span style={{ color: CYN, fontFamily: "monospace", fontSize: 13, fontWeight: "bold" }}>
+          Pushdown Automaton
+        </span>
+        <span style={{ color: "#666", fontFamily: "monospace", fontSize: 11 }}>
+          (11+00)(1+0)* (101+111+01)(00*+11*)(1+0+11)
+        </span>
+        <span style={{ marginLeft: "auto", color: "#444", fontFamily: "monospace", fontSize: 10 }}>
+          drag to pan · scroll to zoom
+        </span>
+      </div>
+
+      {/* Scrollable canvas */}
+      <div
+        ref={containerRef}
+        className="w-full h-full overflow-auto cursor-grab active:cursor-grabbing select-none"
+        style={{ flex: 1, overflow: "auto", cursor: isDragging ? "grabbing" : "grab", userSelect: "none" }}
+        onMouseDown={onMouseDown}
+        onMouseMove={onMouseMove}
+        onMouseUp={onMouseUp}
+        onMouseLeave={onMouseUp}
+      >
+        <svg
+          width={GRID_W}
+          height={GRID_H}
+          viewBox={`0 0 ${GRID_W} ${GRID_H}`}
+          style={{ display: "block", background: DARK }}
+        >
+          <Defs />
+
+          {/* Subtle grid */}
+          <defs>
+            <pattern id="grid" width="40" height="40" patternUnits="userSpaceOnUse">
+              <path d="M40,0 L0,0 L0,40" fill="none" stroke="#ffffff08" strokeWidth="0.5" />
+            </pattern>
+          </defs>
+          <rect width={GRID_W} height={GRID_H} fill="url(#grid)" />
+
+          {/* Section labels */}
+          {[
+            { x: 120, label: "(11+00)" },
+            { x: 560, label: "(1+0)*" },
+            { x: 830, label: "(101+111+01)" },
+            { x: 1130, label: "(00*+11*)" },
+            { x: 1380, label: "(1+0+11)" },
+            { x: 1560, label: "ACCEPT" },
+          ].map((s, i) => (
+            <text key={i} x={s.x} y={24} textAnchor="middle" fill={CYN + "55"} fontSize={10} fontFamily="monospace" fontStyle="italic">
+              {s.label}
+            </text>
+          ))}
+
+          {/* Edges (drawn under nodes) */}
+          {EDGES.map((e, i) => <EdgeLine key={i} e={e} />)}
+
+          {/* Nodes */}
+          {NODES.map((n) => renderNode(n))}
+        </svg>
+      </div>
+
+      {/* Legend */}
+      <div style={{
+        display: "flex", gap: 24, padding: "8px 20px",
+        borderTop: `1px solid ${CYN}22`,
+        flexShrink: 0,
+      }}>
+        {[
+          { color: PUR, label: "START" },
+          { color: CYN, label: "READ state" },
+          { color: GRN, label: "ACCEPT" },
+          { color: RED, label: "REJECT" },
+        ].map((l) => (
+          <div key={l.label} style={{ display: "flex", alignItems: "center", gap: 6 }}>
+            <div style={{ width: 10, height: 10, borderRadius: "50%", background: l.color }} />
+            <span style={{ color: l.color, fontFamily: "monospace", fontSize: 10 }}>{l.label}</span>
+          </div>
+        ))}
+      </div>
+    </div>
+  );
 };
 
-/** Generic oval */
-const Ovl: React.FC<{
-  cx: number; cy: number; rx?: number; ry?: number;
-  label: string; fill: string; stroke: string; textFill: string;
-}> = ({ cx, cy, rx = OR.rx, ry = OR.ry, label, fill, stroke, textFill }) => (
-  <g>
-    <ellipse cx={cx} cy={cy} rx={rx} ry={ry}
-      fill={fill} stroke={stroke} strokeWidth={1.8} />
-    <text x={cx} y={cy}
-      textAnchor="middle" dominantBaseline="central"
-      fontSize={9} fontWeight={800} fill={textFill} letterSpacing={0.4}>
-      {label}
-    </text>
-  </g>
-);
-
-/** REJECT shorthand */
-const Rej: React.FC<{ cx: number; cy: number }> = ({ cx, cy }) => (
-  <Ovl cx={cx} cy={cy} rx={SR.rx} ry={SR.ry} label="REJECT"
-    fill={T.rejectFill} stroke={T.rejectStroke} textFill="#f87171" />
-);
-
-// ── Stage section label ────────────────────────────────────────
-const StageLabel: React.FC<{ x: number; text: string }> = ({ x, text }) => (
-  <text x={x} y={22} textAnchor="middle"
-    fontSize={9} fontWeight={600} fill="#374151" letterSpacing={0.3}>
-    {text}
-  </text>
-);
-
-// ── Vertical stage divider ─────────────────────────────────────
-const Divider: React.FC<{ x: number }> = ({ x }) => (
-  <line x1={x} y1={35} x2={x} y2={VH - 20}
-    stroke="#1f2937" strokeWidth={1} strokeDasharray="4,4" />
-);
-
-// ── Main component ─────────────────────────────────────────────
-const PDABinaryFlowchart: React.FC = () => (
-  <div
-    className="w-full h-full overflow-auto cursor-grab active:cursor-grabbing select-none"
-    style={{ background: T.bg, WebkitOverflowScrolling: "touch" as never }}
-  >
-    <svg
-      viewBox={`0 0 ${VW} ${VH}`}
-      width={VW} height={VH}
-      xmlns="http://www.w3.org/2000/svg"
-      style={{ display: "block", minWidth: VW }}
-    >
-      {/* ── Arrowhead markers ── */}
-      <defs>
-        <Marker id="mg"  color={T.arrowGrey}  />
-        <Marker id="mr"  color={T.arrowRed}   />
-        <Marker id="mc"  color={T.arrowGreen} />
-        <Marker id="mcy" color={T.arrowCyan}  />
-      </defs>
-
-      {/* ── Stage dividers & labels ── */}
-      <Divider x={120} />
-      <Divider x={390} />
-      <Divider x={510} />
-      <Divider x={880} />
-      <Divider x={1120} />
-      <Divider x={1430} />
-
-      <StageLabel x={63}   text="START" />
-      <StageLabel x={250}  text="S1: (11+00)" />
-      <StageLabel x={450}  text="S2: (1+0)*" />
-      <StageLabel x={700}  text="S3: (101+111+01)" />
-      <StageLabel x={1000} text="S4: (00*+11*)" />
-      <StageLabel x={1275} text="S5: (1+0+11)" />
-      <StageLabel x={1550} text="END" />
-
-      {/* ══════════════════════════════════════════════════════
-          EDGES  (all drawn before nodes)
-          ══════════════════════════════════════════════════════ */}
-
-      {/* ── START → S1 ── */}
-      <Arrow pts={[[N.start[0]+OR.rx, N.start[1]], [N.s1[0]-DW, N.s1[1]]]}
-        marker="mg" color={T.arrowGrey} />
-
-      {/* ── S1 → S1b1  ('1', branch up) ── */}
-      <Arrow
-        pts={[[N.s1[0]+10, N.s1[1]-DH], [N.s1b1[0]-DW, N.s1b1[1]]]}
-        marker="mg" color={T.arrowGrey}
-      />
-      <EL x={225} y={272} text="1" />
-
-      {/* ── S1 → S1b0  ('0', branch down) ── */}
-      <Arrow
-        pts={[[N.s1[0]+10, N.s1[1]+DH], [N.s1b0[0]-DW, N.s1b0[1]]]}
-        marker="mg" color={T.arrowGrey}
-      />
-      <EL x={225} y={468} text="0" />
-
-      {/* ── S1 → REJ_S1_d  (Δ, down) ── */}
-      <Arrow
-        pts={[[N.s1[0], N.s1[1]+DH], [N.rej_s1_d[0], N.rej_s1_d[1]-SR.ry]]}
-        marker="mr" color={T.arrowRed}
-      />
-      <EL x={158} y={437} text="Δ" red />
-
-      {/* ── S1b1 → LOOP  ('1' = got "11", advance) ── */}
-      <Arrow
-        pts={[[N.s1b1[0]+DW, N.s1b1[1]], [N.loop[0]-DW, N.loop[1]]]}
-        marker="mcy" color={T.arrowCyan}
-      />
-      <EL x={363} y={268} text="1" cyan />
-
-      {/* ── S1b1 → REJ_S1b1_0  ('0' = got "10", REJECT) ── */}
-      <Arrow
-        pts={[[N.s1b1[0]-10, N.s1b1[1]-DH], [N.rej_s1b1_0[0]+SR.rx, N.rej_s1b1_0[1]]]}
-        marker="mr" color={T.arrowRed}
-      />
-      <EL x={248} y={143} text="0" red />
-
-      {/* ── S1b1 → REJ_S1b1_d  (Δ, up-right) ── */}
-      <Arrow
-        pts={[[N.s1b1[0]+10, N.s1b1[1]-DH], [N.rej_s1b1_d[0]-SR.rx, N.rej_s1b1_d[1]]]}
-        marker="mr" color={T.arrowRed}
-      />
-      <EL x={320} y={143} text="Δ" red />
-
-      {/* ── S1b0 → LOOP  ('0' = got "00", advance) ── */}
-      <Arrow
-        pts={[[N.s1b0[0]+DW, N.s1b0[1]], [N.loop[0]-DW, N.loop[1]]]}
-        marker="mcy" color={T.arrowCyan}
-      />
-      <EL x={363} y={472} text="0" cyan />
-
-      {/* ── S1b0 → REJ_S1b0_1  ('1' = got "01", REJECT) ── */}
-      <Arrow
-        pts={[[N.s1b0[0]-10, N.s1b0[1]+DH], [N.rej_s1b0_1[0]+SR.rx, N.rej_s1b0_1[1]]]}
-        marker="mr" color={T.arrowRed}
-      />
-      <EL x={248} y={597} text="1" red />
-
-      {/* ── S1b0 → REJ_S1b0_d  (Δ) ── */}
-      <Arrow
-        pts={[[N.s1b0[0]+10, N.s1b0[1]+DH], [N.rej_s1b0_d[0]-SR.rx, N.rej_s1b0_d[1]]]}
-        marker="mr" color={T.arrowRed}
-      />
-      <EL x={320} y={597} text="Δ" red />
-
-      {/* ── LOOP self-loop  (1, 0) ── */}
-      <SelfLoop cx={N.loop[0]} cy={N.loop[1]} color={T.loopStroke} markerId="mg" />
-      <EL x={435} y={323} text="1, 0" green />
-
-      {/* ── LOOP → S3_BRANCH  (Δ, ε-transition) ── */}
-      <Arrow
-        pts={[[N.loop[0]+DW, N.loop[1]], [N.s3br[0]-DW, N.s3br[1]]]}
-        marker="mg" color={T.arrowGrey} dashed
-      />
-      <EL x={497} y={358} text="Δ" />
-
-      {/* ── S3_BRANCH → S3_1  ('1', upper) ── */}
-      <Arrow
-        pts={[[N.s3br[0]+15, N.s3br[1]-DH], [N.s3_1[0]-DW, N.s3_1[1]]]}
-        marker="mg" color={T.arrowGrey}
-      />
-      <EL x={611} y={270} text="1" />
-
-      {/* ── S3_BRANCH → S3_0  ('0', lower) ── */}
-      <Arrow
-        pts={[[N.s3br[0]+15, N.s3br[1]+DH], [N.s3_0[0]-DW, N.s3_0[1]]]}
-        marker="mg" color={T.arrowGrey}
-      />
-      <EL x={611} y={470} text="0" />
-
-      {/* ── S3_BRANCH → REJ_S3_d  (Δ) ── */}
-      <Arrow
-        pts={[[N.s3br[0], N.s3br[1]+DH], [N.rej_s3_d[0], N.rej_s3_d[1]-SR.ry]]}
-        marker="mr" color={T.arrowRed}
-      />
-      <EL x={548} y={437} text="Δ" red />
-
-      {/* ── S3_1 → S3_10  ('0') ── */}
-      <Arrow
-        pts={[[N.s3_1[0]+DW, N.s3_1[1]], [N.s3_10[0]-DW, N.s3_10[1]]]}
-        marker="mg" color={T.arrowGrey}
-      />
-      <EL x={727} y={205} text="0" />
-
-      {/* ── S3_1 → S3_11  ('1') ── */}
-      <Arrow
-        pts={[[N.s3_1[0]+10, N.s3_1[1]-DH], [N.s3_11[0]-DW, N.s3_11[1]]]}
-        marker="mg" color={T.arrowGrey}
-      />
-      <EL x={722} y={162} text="1" />
-
-      {/* ── S3_1 → REJ_S3_1_d  (Δ) ── */}
-      <Arrow
-        pts={[[N.s3_1[0]-10, N.s3_1[1]-DH], [N.rej_s3_1_d[0]+SR.rx, N.rej_s3_1_d[1]]]}
-        marker="mr" color={T.arrowRed}
-      />
-      <EL x={656} y={143} text="Δ" red />
-
-      {/* ── S3_0 → S4_BRANCH  ('1' = completed "01") ── */}
-      <Arrow
-        pts={[[N.s3_0[0]+DW, N.s3_0[1]], [N.s4br[0]+10, N.s4br[1]+DH]]}
-        marker="mcy" color={T.arrowCyan}
-      />
-      <EL x={798} y={486} text="1" cyan />
-
-      {/* ── S3_0 → REJ_S3_0_x  (non-'1') ── */}
-      <Arrow
-        pts={[[N.s3_0[0]+10, N.s3_0[1]+DH], [N.rej_s3_0_x[0]-SR.rx, N.rej_s3_0_x[1]]]}
-        marker="mr" color={T.arrowRed}
-      />
-      <EL x={705} y={597} text="0, Δ" red />
-
-      {/* ── S3_10 → S4_BRANCH  ('1' = completed "101") ── */}
-      <Arrow
-        pts={[[N.s3_10[0]+DW, N.s3_10[1]], [N.s4br[0]-10, N.s4br[1]-DH]]}
-        marker="mcy" color={T.arrowCyan}
-      />
-      <EL x={862} y={284} text="1" cyan />
-
-      {/* ── S3_10 → REJ_S3_10_x  (non-'1') ── */}
-      <Arrow
-        pts={[[N.s3_10[0]+DW, N.s3_10[1]], [N.rej_s3_10_x[0]-SR.rx, N.rej_s3_10_x[1]]]}
-        marker="mr" color={T.arrowRed}
-      />
-      <EL x={828} y={222} text="0, Δ" red />
-
-      {/* ── S3_11 → S4_BRANCH  ('1' = completed "111") ── */}
-      <Arrow
-        pts={[
-          [N.s3_11[0]+DW, N.s3_11[1]],
-          [N.s4br[0], N.s4br[1]-DH-10],
-        ]}
-        marker="mcy" color={T.arrowCyan}
-      />
-      <EL x={854} y={222} text="1" cyan />
-
-      {/* ── S3_11 → REJ_S3_11_x  (non-'1') ── */}
-      <Arrow
-        pts={[[N.s3_11[0]+DW, N.s3_11[1]], [N.rej_s3_11_x[0]-SR.rx, N.rej_s3_11_x[1]]]}
-        marker="mr" color={T.arrowRed}
-      />
-      <EL x={828} y={140} text="0, Δ" red />
-
-      {/* ── S4_BRANCH → S4_1loop  ('1', upper) ── */}
-      <Arrow
-        pts={[[N.s4br[0]+15, N.s4br[1]-DH], [N.s4_1loop[0]-DW, N.s4_1loop[1]]]}
-        marker="mg" color={T.arrowGrey}
-      />
-      <EL x={975} y={268} text="1" />
-
-      {/* ── S4_BRANCH → S4_0loop  ('0', lower) ── */}
-      <Arrow
-        pts={[[N.s4br[0]+15, N.s4br[1]+DH], [N.s4_0loop[0]-DW, N.s4_0loop[1]]]}
-        marker="mg" color={T.arrowGrey}
-      />
-      <EL x={975} y={472} text="0" />
-
-      {/* ── S4_BRANCH → REJ_S4_d  (Δ) ── */}
-      <Arrow
-        pts={[[N.s4br[0], N.s4br[1]+DH], [N.rej_s4_d[0], N.rej_s4_d[1]-SR.ry]]}
-        marker="mr" color={T.arrowRed}
-      />
-      <EL x={908} y={437} text="Δ" red />
-
-      {/* ── S4_1loop self-loop  ('1') ── */}
-      <SelfLoop cx={N.s4_1loop[0]} cy={N.s4_1loop[1]} color={T.loopStroke} markerId="mg" />
-      <EL x={1035} y={148} text="1" green />
-
-      {/* ── S4_1loop → S5_BRANCH  (Δ) ── */}
-      <Arrow
-        pts={[[N.s4_1loop[0]+DW, N.s4_1loop[1]], [N.s5br[0]-10, N.s5br[1]-DH]]}
-        marker="mg" color={T.arrowGrey} dashed
-      />
-      <EL x={1097} y={268} text="Δ" />
-
-      {/* ── S4_0loop self-loop  ('0') ── */}
-      <SelfLoop cx={N.s4_0loop[0]} cy={N.s4_0loop[1]} color={T.loopStroke} markerId="mg" />
-      <EL x={1035} y={592} text="0" green />
-
-      {/* ── S4_0loop → S5_BRANCH  (Δ) ── */}
-      <Arrow
-        pts={[[N.s4_0loop[0]+DW, N.s4_0loop[1]], [N.s5br[0]-10, N.s5br[1]+DH]]}
-        marker="mg" color={T.arrowGrey} dashed
-      />
-      <EL x={1097} y={472} text="Δ" />
-
-      {/* ── S5_BRANCH → S5_1  ('1', upper) ── */}
-      <Arrow
-        pts={[[N.s5br[0]+15, N.s5br[1]-DH], [N.s5_1[0]-DW, N.s5_1[1]]]}
-        marker="mg" color={T.arrowGrey}
-      />
-      <EL x={1213} y={268} text="1" />
-
-      {/* ── S5_BRANCH → S5_0  ('0', lower) ── */}
-      <Arrow
-        pts={[[N.s5br[0]+15, N.s5br[1]+DH], [N.s5_0[0]-DW, N.s5_0[1]]]}
-        marker="mg" color={T.arrowGrey}
-      />
-      <EL x={1213} y={472} text="0" />
-
-      {/* ── S5_BRANCH → REJ_S5_d  (Δ) ── */}
-      <Arrow
-        pts={[[N.s5br[0], N.s5br[1]+DH], [N.rej_s5_d[0], N.rej_s5_d[1]-SR.ry]]}
-        marker="mr" color={T.arrowRed}
-      />
-      <EL x={1148} y={437} text="Δ" red />
-
-      {/* ── S5_1 → R.ACC  (Δ = just "1", valid end) ── */}
-      <Arrow
-        pts={[[N.s5_1[0]+DW, N.s5_1[1]], [N.racc[0]-10, N.racc[1]-DH]]}
-        marker="mc" color={T.arrowGreen}
-      />
-      <EL x={1367} y={268} text="Δ" green />
-
-      {/* ── S5_1 → S5_11  ('1' = building "11") ── */}
-      <Arrow
-        pts={[[N.s5_1[0]+10, N.s5_1[1]-DH], [N.s5_11[0]-DW, N.s5_11[1]]]}
-        marker="mg" color={T.arrowGrey}
-      />
-      <EL x={1330} y={162} text="1" />
-
-      {/* ── S5_1 → REJ_S5_1_x  (0, non-terminal) ── */}
-      <Arrow
-        pts={[[N.s5_1[0]-10, N.s5_1[1]-DH], [N.rej_s5_1_x[0]+SR.rx, N.rej_s5_1_x[1]]]}
-        marker="mr" color={T.arrowRed}
-      />
-      <EL x={1255} y={143} text="0" red />
-
-      {/* ── S5_0 → R.ACC  (Δ = just "0", valid end) ── */}
-      <Arrow
-        pts={[[N.s5_0[0]+DW, N.s5_0[1]], [N.racc[0]-10, N.racc[1]+DH]]}
-        marker="mc" color={T.arrowGreen}
-      />
-      <EL x={1367} y={472} text="Δ" green />
-
-      {/* ── S5_0 → REJ_S5_0_x  (non-Δ) ── */}
-      <Arrow
-        pts={[[N.s5_0[0]+10, N.s5_0[1]+DH], [N.rej_s5_0_x[0]-SR.rx, N.rej_s5_0_x[1]]]}
-        marker="mr" color={T.arrowRed}
-      />
-      <EL x={1278} y={597} text="1, 0" red />
-
-      {/* ── S5_11 → R.ACC  (Δ = got "11", valid end) ── */}
-      <Arrow
-        pts={[[N.s5_11[0]+DW, N.s5_11[1]], [N.racc[0]-10, N.racc[1]-DH-10]]}
-        marker="mc" color={T.arrowGreen}
-      />
-      <EL x={1428} y={260} text="Δ" green />
-
-      {/* ── S5_11 → REJ_S5_11_x  (non-Δ) ── */}
-      <Arrow
-        pts={[[N.s5_11[0]+DW, N.s5_11[1]], [N.rej_s5_11_x[0]-SR.rx, N.rej_s5_11_x[1]]]}
-        marker="mr" color={T.arrowRed}
-      />
-      <EL x={1392} y={118} text="1, 0" red />
-
-      {/* ── R.ACC → ACCEPT  (Δ) ── */}
-      <Arrow
-        pts={[[N.racc[0]+DW, N.racc[1]], [N.accept[0]-OR.rx, N.accept[1]]]}
-        marker="mc" color={T.arrowGreen}
-      />
-      <EL x={1522} y={358} text="Δ" green />
-
-      {/* ══════════════════════════════════════════════════════
-          NODES  (rendered on top of all edges)
-          ══════════════════════════════════════════════════════ */}
-
-      {/* ── Terminals ── */}
-      <Ovl cx={N.start[0]} cy={N.start[1]} label="START"
-        fill={T.startFill} stroke={T.startStroke} textFill="#c084fc" />
-      <Ovl cx={N.accept[0]} cy={N.accept[1]} rx={40} ry={18} label="ACCEPT"
-        fill={T.acceptFill} stroke={T.acceptStroke} textFill="#4ade80" />
-
-      {/* ── Stage 1 REJECT nodes ── */}
-      <Rej cx={N.rej_s1_d[0]}   cy={N.rej_s1_d[1]}   />
-      <Rej cx={N.rej_s1b1_0[0]} cy={N.rej_s1b1_0[1]} />
-      <Rej cx={N.rej_s1b1_d[0]} cy={N.rej_s1b1_d[1]} />
-      <Rej cx={N.rej_s1b0_1[0]} cy={N.rej_s1b0_1[1]} />
-      <Rej cx={N.rej_s1b0_d[0]} cy={N.rej_s1b0_d[1]} />
-
-      {/* ── Stage 3 REJECT nodes ── */}
-      <Rej cx={N.rej_s3_d[0]}   cy={N.rej_s3_d[1]}   />
-      <Rej cx={N.rej_s3_1_d[0]} cy={N.rej_s3_1_d[1]} />
-      <Rej cx={N.rej_s3_0_x[0]} cy={N.rej_s3_0_x[1]} />
-      <Rej cx={N.rej_s3_10_x[0]}cy={N.rej_s3_10_x[1]}/>
-      <Rej cx={N.rej_s3_11_x[0]}cy={N.rej_s3_11_x[1]}/>
-
-      {/* ── Stage 4 REJECT node ── */}
-      <Rej cx={N.rej_s4_d[0]} cy={N.rej_s4_d[1]} />
-
-      {/* ── Stage 5 REJECT nodes ── */}
-      <Rej cx={N.rej_s5_d[0]}   cy={N.rej_s5_d[1]}   />
-      <Rej cx={N.rej_s5_1_x[0]} cy={N.rej_s5_1_x[1]} />
-      <Rej cx={N.rej_s5_0_x[0]} cy={N.rej_s5_0_x[1]} />
-      <Rej cx={N.rej_s5_11_x[0]}cy={N.rej_s5_11_x[1]}/>
-
-      {/* ── Stage 1 READ diamonds ── */}
-      <Dmd cx={N.s1[0]}   cy={N.s1[1]}   line1="READ" line2="S1" />
-      <Dmd cx={N.s1b1[0]} cy={N.s1b1[1]} line1="READ" line2="1b" />
-      <Dmd cx={N.s1b0[0]} cy={N.s1b0[1]} line1="READ" line2="0b" />
-
-      {/* ── Stage 2 LOOP diamond (green variant) ── */}
-      <Dmd cx={N.loop[0]} cy={N.loop[1]} line1="LOOP" line2="1+0" loop />
-
-      {/* ── Stage 3 READ diamonds ── */}
-      <Dmd cx={N.s3br[0]}  cy={N.s3br[1]}  line1="READ" line2="S3" />
-      <Dmd cx={N.s3_1[0]}  cy={N.s3_1[1]}  line1="READ" line2="3a" />
-      <Dmd cx={N.s3_0[0]}  cy={N.s3_0[1]}  line1="READ" line2="3b" />
-      <Dmd cx={N.s3_10[0]} cy={N.s3_10[1]} line1="READ" line2="3c" />
-      <Dmd cx={N.s3_11[0]} cy={N.s3_11[1]} line1="READ" line2="3d" />
-
-      {/* ── Stage 4 READ diamonds ── */}
-      <Dmd cx={N.s4br[0]}     cy={N.s4br[1]}     line1="READ" line2="S4" />
-      <Dmd cx={N.s4_1loop[0]} cy={N.s4_1loop[1]} line1="LOOP" line2="1*" loop />
-      <Dmd cx={N.s4_0loop[0]} cy={N.s4_0loop[1]} line1="LOOP" line2="0*" loop />
-
-      {/* ── Stage 5 READ diamonds ── */}
-      <Dmd cx={N.s5br[0]}  cy={N.s5br[1]}  line1="READ" line2="S5" />
-      <Dmd cx={N.s5_1[0]}  cy={N.s5_1[1]}  line1="READ" line2="5a" />
-      <Dmd cx={N.s5_0[0]}  cy={N.s5_0[1]}  line1="READ" line2="5b" />
-      <Dmd cx={N.s5_11[0]} cy={N.s5_11[1]} line1="READ" line2="5c" />
-
-      {/* ── R.ACC ── */}
-      <Dmd cx={N.racc[0]} cy={N.racc[1]} line1="R.ACC" />
-
-      {/* ── Diagram footer ── */}
-      <text x={VW / 2} y={VH - 12} textAnchor="middle"
-        fontSize={10} fill={T.dimLabel} letterSpacing={0.3}>
-        Pushdown Automaton · (11+00)(1+0)* (101+111+01)(00*+11*)(1+0+11)
-      </text>
-    </svg>
-  </div>
-);
-
 export default PDABinaryFlowchart;
+
